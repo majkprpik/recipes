@@ -9,8 +9,9 @@ Requires:
     - ollama running locally (ollama serve)
     - model pulled: ollama pull llama3.1:8b
     - yt-dlp binary (brew install yt-dlp)
-    - ffmpeg (brew install ffmpeg)  -- needed for Whisper fallback
-    - pip install requests faster-whisper
+    - ffmpeg (brew install ffmpeg)  -- needed for Whisper fallback & OCR frames
+    - tesseract (brew install tesseract)  -- for on-screen text OCR
+    - pip install requests faster-whisper pytesseract pillow
 """
 
 import argparse
@@ -26,6 +27,7 @@ import requests
 OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL = "llama3.1:8b"
 WHISPER_MODEL = "small"  # tiny, base, small, medium, large-v3
+OCR_FPS = 0.5  # frames per second to sample for OCR (0.5 = one frame every 2s)
 
 PROMPT = """You are a recipe extractor. Below is a transcript of a cooking video.
 Extract the recipe and return ONLY valid JSON with this exact shape:
@@ -88,6 +90,52 @@ def get_transcript(url: str) -> tuple[str, str]:
         ], check=True)
         audio = next(tmp.glob("audio.*"))
         return title, whisper_transcribe(audio)
+
+
+def extract_on_screen_text(url: str) -> list[str]:
+    """Download video, sample frames, OCR each, dedupe near-duplicates. Returns ordered unique lines."""
+    import pytesseract
+    from PIL import Image
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        print("Downloading video for OCR...", file=sys.stderr)
+        subprocess.run([
+            "yt-dlp",
+            "-f", "mp4",
+            "-o", str(tmp / "video.%(ext)s"),
+            url,
+        ], check=True)
+        video = next(tmp.glob("video.*"))
+
+        frames_dir = tmp / "frames"
+        frames_dir.mkdir()
+        print(f"Extracting frames at {OCR_FPS} fps...", file=sys.stderr)
+        subprocess.run([
+            "ffmpeg", "-i", str(video),
+            "-vf", f"fps={OCR_FPS}",
+            "-q:v", "2",
+            str(frames_dir / "f_%04d.jpg"),
+            "-loglevel", "error",
+        ], check=True)
+
+        frames = sorted(frames_dir.glob("*.jpg"))
+        print(f"OCR on {len(frames)} frames...", file=sys.stderr)
+
+        seen = set()
+        ordered = []
+        for f in frames:
+            txt = pytesseract.image_to_string(Image.open(f)).strip()
+            for line in txt.splitlines():
+                line = line.strip()
+                if len(line) < 2:
+                    continue
+                key = re.sub(r"\s+", " ", line.lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+                ordered.append(line)
+        return ordered
 
 
 def whisper_transcribe(audio_path: Path) -> str:
@@ -167,6 +215,12 @@ def main():
 
     print("Fetching transcript...", file=sys.stderr)
     video_title, transcript = get_transcript(args.url)
+
+    ocr_lines = extract_on_screen_text(args.url)
+    print("\n===== OCR LINES (on-screen text) =====", file=sys.stderr)
+    for line in ocr_lines:
+        print(f"  | {line}", file=sys.stderr)
+    print(f"===== {len(ocr_lines)} unique lines =====\n", file=sys.stderr)
 
     print(f"Extracting recipe via {MODEL}...", file=sys.stderr)
     recipe = call_ollama(transcript)
