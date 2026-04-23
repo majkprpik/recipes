@@ -27,7 +27,7 @@ import requests
 OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL = "llama3.1:8b"
 WHISPER_MODEL = "small"  # tiny, base, small, medium, large-v3
-OCR_FPS = 0.5  # frames per second to sample for OCR (0.5 = one frame every 2s)
+OCR_FPS = 2  # frames per second to sample for OCR
 
 PROMPT = """You are a recipe extractor. Below is a transcript of a cooking video.
 Extract the recipe and return ONLY valid JSON with this exact shape:
@@ -95,7 +95,7 @@ def get_transcript(url: str) -> tuple[str, str]:
 def extract_on_screen_text(url: str) -> list[str]:
     """Download video, sample frames, OCR each, dedupe near-duplicates. Returns ordered unique lines."""
     import pytesseract
-    from PIL import Image
+    from PIL import Image, ImageOps, ImageFilter
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -125,17 +125,39 @@ def extract_on_screen_text(url: str) -> list[str]:
         seen = set()
         ordered = []
         for f in frames:
-            txt = pytesseract.image_to_string(Image.open(f)).strip()
-            for line in txt.splitlines():
-                line = line.strip()
-                if len(line) < 2:
-                    continue
-                key = re.sub(r"\s+", " ", line.lower())
-                if key in seen:
-                    continue
-                seen.add(key)
-                ordered.append(line)
+            for variant in preprocess_variants(f):
+                txt = pytesseract.image_to_string(variant, config="--psm 6").strip()
+                for line in txt.splitlines():
+                    line = line.strip()
+                    if len(line) < 2:
+                        continue
+                    # drop lines that are mostly garbage (non-letter chars)
+                    letters = sum(c.isalpha() for c in line)
+                    if letters < max(2, len(line) // 2):
+                        continue
+                    key = re.sub(r"\s+", " ", line.lower())
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    ordered.append(line)
         return ordered
+
+
+def preprocess_variants(frame_path: Path):
+    """Yield several preprocessed versions of a frame to improve OCR recall on stylized fonts."""
+    from PIL import Image, ImageOps, ImageFilter
+    img = Image.open(frame_path)
+    # upscale 2x for tiny overlay text
+    w, h = img.size
+    img = img.resize((w * 2, h * 2), Image.LANCZOS)
+    gray = ImageOps.grayscale(img)
+    # variant 1: high contrast
+    yield ImageOps.autocontrast(gray, cutoff=5)
+    # variant 2: inverted (for dark-on-light overlays)
+    yield ImageOps.invert(ImageOps.autocontrast(gray, cutoff=5))
+    # variant 3: sharpened binary-ish
+    sharp = gray.filter(ImageFilter.SHARPEN)
+    yield ImageOps.autocontrast(sharp, cutoff=10)
 
 
 def whisper_transcribe(audio_path: Path) -> str:
