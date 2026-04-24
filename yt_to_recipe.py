@@ -29,8 +29,16 @@ MODEL = "llama3.1:8b"
 WHISPER_MODEL = "small"  # tiny, base, small, medium, large-v3
 OCR_FPS = 2  # frames per second to sample for OCR
 
-PROMPT = """You are a recipe extractor. Below is a transcript of a cooking video.
-Extract the recipe and return ONLY valid JSON with this exact shape:
+PROMPT = """You are a recipe extractor. You have TWO sources of information about a cooking video:
+
+1. SPOKEN TRANSCRIPT — what the cook said out loud (may be incomplete or conversational).
+2. ON-SCREEN TEXT — captions/overlays shown in the video (often lists exact ingredients and quantities).
+
+Combine BOTH sources. When they disagree, prefer ON-SCREEN TEXT for ingredients and quantities
+(those captions are usually the canonical recipe), and prefer TRANSCRIPT for technique and order of steps.
+Do not omit ingredients that only appear on-screen. Do not invent anything that is in neither source.
+
+Return ONLY valid JSON with this exact shape:
 
 {
   "title": "short recipe title",
@@ -43,15 +51,20 @@ Extract the recipe and return ONLY valid JSON with this exact shape:
 }
 
 Rules:
-- Use exact quantities from the transcript when stated.
+- Use exact quantities where stated (prefer on-screen values).
 - If a quantity is vague ("a splash"), keep it as-is.
 - Steps should be concise imperative sentences.
 - Do NOT include ads, intros, outros, or sponsor mentions.
 - Output JSON only, no markdown fences, no commentary.
 
-TRANSCRIPT:
+SPOKEN TRANSCRIPT:
 ---
 {transcript}
+---
+
+ON-SCREEN TEXT (deduplicated, in order of appearance):
+---
+{onscreen}
 ---
 """
 
@@ -179,8 +192,8 @@ def vtt_to_plain(vtt: str) -> str:
     return " ".join(lines)
 
 
-def call_ollama(transcript: str) -> dict:
-    prompt = PROMPT.replace("{transcript}", transcript[:16000])
+def call_ollama(transcript: str, onscreen: str) -> dict:
+    prompt = PROMPT.replace("{transcript}", transcript[:16000]).replace("{onscreen}", onscreen[:8000])
     r = requests.post(
         OLLAMA_URL,
         json={
@@ -240,7 +253,8 @@ def main():
     print(f"===== {len(ocr_lines)} unique lines =====\n", file=sys.stderr)
 
     print(f"Extracting recipe via {MODEL}...", file=sys.stderr)
-    recipe = call_ollama(transcript)
+    onscreen = "\n".join(ocr_lines)
+    recipe = call_ollama(transcript, onscreen)
 
     md = to_markdown(recipe, args.url)
     fname = slugify(recipe.get("title") or video_title) + ".md"
