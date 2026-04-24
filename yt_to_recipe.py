@@ -10,8 +10,8 @@ Requires:
     - model pulled: ollama pull llama3.1:8b
     - yt-dlp binary (brew install yt-dlp)
     - ffmpeg (brew install ffmpeg)  -- needed for Whisper fallback & OCR frames
-    - tesseract (brew install tesseract)  -- for on-screen text OCR
-    - pip install requests faster-whisper pytesseract pillow
+    - pip install requests faster-whisper pyobjc-framework-Vision pyobjc-framework-Quartz
+    (Apple Vision framework handles OCR — no external OCR install needed, macOS only)
 """
 
 import argparse
@@ -93,10 +93,7 @@ def get_transcript(url: str) -> tuple[str, str]:
 
 
 def extract_on_screen_text(url: str) -> list[str]:
-    """Download video, sample frames, OCR each, dedupe near-duplicates. Returns ordered unique lines."""
-    import pytesseract
-    from PIL import Image, ImageOps, ImageFilter
-
+    """Download video, sample frames, OCR with Apple Vision, dedupe. Returns ordered unique lines."""
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         print("Downloading video for OCR...", file=sys.stderr)
@@ -120,44 +117,42 @@ def extract_on_screen_text(url: str) -> list[str]:
         ], check=True)
 
         frames = sorted(frames_dir.glob("*.jpg"))
-        print(f"OCR on {len(frames)} frames...", file=sys.stderr)
+        print(f"OCR on {len(frames)} frames (Apple Vision)...", file=sys.stderr)
 
         seen = set()
         ordered = []
         for f in frames:
-            for variant in preprocess_variants(f):
-                txt = pytesseract.image_to_string(variant, config="--psm 6").strip()
-                for line in txt.splitlines():
-                    line = line.strip()
-                    if len(line) < 2:
-                        continue
-                    # drop lines that are mostly garbage (non-letter chars)
-                    letters = sum(c.isalpha() for c in line)
-                    if letters < max(2, len(line) // 2):
-                        continue
-                    key = re.sub(r"\s+", " ", line.lower())
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    ordered.append(line)
+            for line in apple_vision_ocr(f):
+                line = line.strip()
+                if len(line) < 2:
+                    continue
+                key = re.sub(r"\s+", " ", line.lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+                ordered.append(line)
         return ordered
 
 
-def preprocess_variants(frame_path: Path):
-    """Yield several preprocessed versions of a frame to improve OCR recall on stylized fonts."""
-    from PIL import Image, ImageOps, ImageFilter
-    img = Image.open(frame_path)
-    # upscale 2x for tiny overlay text
-    w, h = img.size
-    img = img.resize((w * 2, h * 2), Image.LANCZOS)
-    gray = ImageOps.grayscale(img)
-    # variant 1: high contrast
-    yield ImageOps.autocontrast(gray, cutoff=5)
-    # variant 2: inverted (for dark-on-light overlays)
-    yield ImageOps.invert(ImageOps.autocontrast(gray, cutoff=5))
-    # variant 3: sharpened binary-ish
-    sharp = gray.filter(ImageFilter.SHARPEN)
-    yield ImageOps.autocontrast(sharp, cutoff=10)
+def apple_vision_ocr(image_path: Path) -> list[str]:
+    """Use macOS Vision framework (VNRecognizeTextRequest) for OCR."""
+    import Vision
+    from Foundation import NSURL
+
+    url = NSURL.fileURLWithPath_(str(image_path))
+    handler = Vision.VNImageRequestHandler.alloc().initWithURL_options_(url, None)
+    request = Vision.VNRecognizeTextRequest.alloc().init()
+    request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
+    request.setUsesLanguageCorrection_(True)
+    handler.performRequests_error_([request], None)
+
+    results = request.results() or []
+    lines = []
+    for obs in results:
+        candidate = obs.topCandidates_(1)
+        if candidate and len(candidate) > 0:
+            lines.append(str(candidate[0].string()))
+    return lines
 
 
 def whisper_transcribe(audio_path: Path) -> str:
